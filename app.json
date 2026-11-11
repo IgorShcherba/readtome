@@ -1,0 +1,41 @@
+{
+  "$schema": "../exact/scripts/app.schema.json",
+  "name": "Read To Me",
+  "short_name": "Read To Me",
+  "id": "com.igorshcherba.readtome",
+  "start_url": "/",
+  "display": "standalone",
+  "audio_session": "playback",
+  "file_handlers": [
+    {
+      "action": "/add",
+      "name": "PDF document",
+      "accept": {
+        "application/pdf": [
+          ".pdf"
+        ]
+      }
+    }
+  ],
+  "app": {
+    "id": "com.igorshcherba.readtome",
+    "name": "Read To Me"
+  },
+  "host": {
+    "web": {},
+    "ios": {
+      "minimumOS": "17.0",
+      "backgroundModes": ["audio"],
+      "deviceFamily": [
+        "iphone",
+        "ipad"
+      ]
+    }
+  },
+  "deploy": {
+    "store": {
+      "web": "0",
+      "ios": "0"
+    }
+  }
+}

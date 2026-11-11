@@ -1,0 +1,73 @@
+test "a new library asks for the key first"
+  clock data
+  expect tree has "empty-action"
+  expect text "empty-action" == "Open Settings"
+  tap "empty-action"
+  clock settle
+  expect tree has "key"
+
+test "a key is checked, kept as a hint and removed"
+  tap "open-settings"
+  clock settle
+  type "key" "not-a-key"
+  tap "save-key"
+  clock data
+  expect text "key-footer" == "That doesn’t look like an OpenAI key (it starts with “sk-”)."
+  type "key" "sk-test0000000000000000000abcd"
+  tap "save-key"
+  clock data
+  expect text "key-hint" == "sk-…abcd"
+  tap "settings-done"
+  clock settle
+  reload
+  clock data
+  expect text "empty-action" == "Add Something"
+  tap "open-settings"
+  clock settle
+  expect text "key-hint" == "sk-…abcd"
+  tap "forget-key"
+  clock data
+  expect tree has "key"
+
+test "a link that can't be reached says so and keeps the sheet"
+  tap "add"
+  clock settle
+  fail fetch "https://unreachable.example"
+  type "url" "unreachable.example/post"
+  tap "add-save"
+  clock data
+  expect text "add-error" == "Couldn’t reach that page. Check the link and your connection."
+  expect text "url" == "unreachable.example/post"
+
+test "a plain http link is refused"
+  tap "add"
+  clock settle
+  type "url" "http://example.com"
+  tap "add-save"
+  clock data
+  expect text "add-error" == "Only https:// links can be read."
+
+test "an article becomes an item in parts, and a bad key fails its audio" on macos, ios
+  tap "open-settings"
+  clock settle
+  type "key" "sk-test0000000000000000000abcd"
+  tap "save-key"
+  clock data
+  tap "settings-done"
+  clock settle
+  tap "add"
+  clock settle
+  type "url" "https://en.wikipedia.org/wiki/Audiobook"
+  tap "add-save"
+  clock data
+  expect tree has "item-title"
+  expect tree has "part-0"
+  clock data
+  expect text "make-error" == "OpenAI didn’t accept the key. Check it in Settings."
+  expect tree has "make"
+  back
+  clock settle
+  expect tree has "item-1"
+  tap "item-1-delete"
+  clock data
+  expect tree missing "item-1"

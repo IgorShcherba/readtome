@@ -1,0 +1,435 @@
+// Read To Me: a link or a PDF becomes audio to listen to. app.ts keeps the library, the OpenAI
+// key (in the Keychain, never in an answer), and turns text into audio one part at a time.
+// The player sits at the root, outside the routes, so listening goes on while you browse.
+use EmptyState from "exact:content"
+
+routes nav
+  library "/"
+    item "/item/:id"
+    add "/add"
+    settings "/settings"
+
+shape Part
+  index: number
+  path: string
+  chars: number
+
+shape Item
+  id: string
+  title: string
+  source: string
+  kind: string
+  voice: string
+  error: string
+  words: number
+  parts: Part[]
+
+shape Reply
+  ok: bool
+  error: string
+  id: string
+
+shape Step
+  ok: bool
+  error: string
+  more: bool
+
+shape KeyStatus
+  saved: bool
+  hint: string
+
+fn made(i: Item): number = i.parts.filter(p => p.path != "").length
+fn ready(i: Item): bool = i.parts.length > 0 and made(i) == i.parts.length
+fn titleOf(items: Item[], id: string): string = match first(items.filter(i => i.id == id)) { case some(i) => i.title, case none => "" }
+fn found(items: Item[], id: string): bool = items.filter(i => i.id == id).length > 0
+fn pathAt(items: Item[], id: string, n: number): string = match first(items.filter(i => i.id == id)) { case some(i) => match i.parts.at(n) { case some(p) => p.path, case none => "" }, case none => "" }
+fn partsOf(items: Item[], id: string): number = match first(items.filter(i => i.id == id)) { case some(i) => i.parts.length, case none => 0 }
+fn pad(n: number): string = n < 10 ? `0${n}` : `${n}`
+fn clockText(s: number): string = `${floor(s / 60)}:${pad(floor(s) - floor(s / 60) * 60)}`
+fn minutesText(words: number): string = `${max(1, round(words / 160))} min`
+fn summary(i: Item): string = ready(i) ? `${minutesText(i.words)} · ${i.parts.length} ${i.parts.length == 1 ? "part" : "parts"}` : made(i) > 0 ? `Audio ${made(i)} of ${i.parts.length}` : `${minutesText(i.words)} · No audio yet`
+
+component App
+  // Settings the person chooses, kept across launches.
+  state voice = "nova" persist
+  state rate = 1 persist
+  // The Add sheet's field, and the last refusal of an add.
+  state draftUrl = ""
+  state addError = ""
+  // The key field in Settings, and the last refusal of a save.
+  state draftKey = ""
+  state keyError = ""
+  // The item whose audio is being made, and why the last part failed.
+  state making = ""
+  state makeError = ""
+  state queued = false
+  // The player: which item and part, and where in it.
+  state playingId = ""
+  state part = 0
+  state paused = true
+  state position = 0
+  state duration = 0
+  state seekTo = 0
+  state aimed = ""
+
+  resource lib = loadItems() as shape Item[] else empty()
+  resource key = keyStatus() as shape KeyStatus else empty()
+  mutation added as shape Reply refreshes lib then afterAdd
+  mutation step as shape Step refreshes lib then afterStep
+  mutation removed as shape Reply refreshes lib
+  mutation keySaved as shape Reply refreshes key then afterKey
+
+  task advance when queued
+    after(1, continueMaking)
+
+  derive nowPath = pathAt(lib, playingId, part)
+  derive nowTitle = titleOf(lib, playingId)
+  derive addReply = match added { case some(r) => r, case none => Reply(ok=false, error="", id="") }
+  derive keyReply = match keySaved { case some(r) => r.error, case none => "" }
+  derive stepReply = match step { case some(s) => s, case none => Step(ok=false, error="", more=false) }
+
+  action back
+    nav = back(nav)
+  action follow(url: string)
+    nav = top(nav).name == "item" and url.startsWith("/item/") ? replace(nav, url) : go(nav, url)
+  action openAdd
+    draftUrl = ""
+    addError = ""
+    nav = push(nav, "/add")
+  action openSettings
+    draftKey = ""
+    keyError = ""
+    nav = push(nav, "/settings")
+  // The empty library's one button: the key first, then something to add.
+  action startHere
+    if key.saved
+      openAdd()
+    else
+      openSettings()
+
+  // Adding: a link, or a PDF from the Files picker.
+  action editUrl(v: string)
+    draftUrl = v
+  action addLink
+    if draftUrl.trim() != "" and not pending(added)
+      addError = ""
+      send added = addLink(draftUrl.trim())
+  action choosePdf
+    showPicker("pdf-file")
+  action pdfPicked(files: Picked[])
+    match first(files)
+      case some(f)
+        addError = ""
+        send added = addPdf(f.path, f.name)
+      case none
+        addError = ""
+  // On an ok reply the sheet gives way to the new item, and its audio starts, given a key.
+  action afterAdd
+    addError = addReply.error
+    if addReply.ok and top(nav).name == "add"
+      nav = replace(nav, path("item", addReply.id))
+      if key.saved
+        making = addReply.id
+        makeError = ""
+        send step = generateNext(addReply.id, voice)
+
+  // Making audio: one part per request, the next sent when one lands.
+  action make(id: string)
+    if making == "" and key.saved
+      making = id
+      makeError = ""
+      send step = generateNext(id, voice)
+  // A mutation's `then` may not send it again: `queued` starts the `advance` task, which does.
+  action afterStep
+    makeError = stepReply.error
+    if stepReply.ok and stepReply.more and making != ""
+      queued = true
+    else
+      making = ""
+  action continueMaking
+    queued = false
+    if making != ""
+      send step = generateNext(making, voice)
+  action chooseVoice(v: string)
+    voice = v
+
+  // The player.
+  action play(id: string, n: number)
+    playingId = id
+    part = n
+    position = 0
+    duration = 0
+    seekTo = 0
+    paused = false
+  action toggle(id: string)
+    if playingId == id
+      paused = not paused
+    else
+      playingId = id
+      part = 0
+      position = 0
+      duration = 0
+      seekTo = 0
+      paused = false
+  action playing
+    paused = false
+  action stopped
+    paused = true
+  action timed(s: number)
+    position = s
+  action measured(s: number)
+    duration = s
+  action skip(by: number)
+    let to = max(0, min(duration, position + by))
+    seekTo = to == seekTo ? to + 0.001 : to
+    position = to
+  action ended
+    if part + 1 < partsOf(lib, playingId) and pathAt(lib, playingId, part + 1) != ""
+      part = part + 1
+      position = 0
+      duration = 0
+      seekTo = 0
+    else
+      paused = true
+      part = 0
+      position = 0
+      seekTo = 0
+  action chooseRate(v: string)
+    rate = v == "0.75" ? 0.75 : v == "1.25" ? 1.25 : v == "1.5" ? 1.5 : v == "2" ? 2 : 1
+
+  // Deleting: a swipe in the library, or the item's Delete, which asks first.
+  action askRemove(id: string)
+    aimed = id
+    showModal("remove")
+  action remove(id: string)
+    send removed = removeItem(id)
+    if playingId == id
+      playingId = ""
+      paused = true
+    if top(nav).name == "item"
+      nav = back(nav)
+
+  // The key.
+  action editKey(v: string)
+    draftKey = v
+  action saveKey
+    if draftKey.trim() != ""
+      send keySaved = saveKey(draftKey.trim())
+  action afterKey
+    keyError = keyReply
+    if keyReply == ""
+      draftKey = ""
+  action forgetKey
+    send keySaved = forgetKey()
+
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow testId="app" width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        if e.name == "library"
+          column navigationKey=`${e.id}` navigationScroll="library-list" position="absolute" inset=0
+            display="flex" flex-direction="column"
+            header display="flex" align-items="center" gap=8 padding="8px 16px"
+              text "Read To Me" role="heading" aria-level=1 flex=1
+              button press=openSettings aria-label="Settings" testId="open-settings"
+                image "symbol:settings"
+              button press=openAdd aria-label="Add" testId="add"
+                image "symbol:add"
+            if failed(lib)
+              EmptyState(symbol="symbol:alert", title="Can’t Open Your Library", message="Something went wrong reading it.")
+            else if lib.length == 0 and not pending(lib)
+              EmptyState(symbol="symbol:waveform", title="Nothing to Listen To Yet", message=(key.saved ? "Add a link to an article or a PDF, and it’s read to you." : "Add your OpenAI key in Settings, then add a link or a PDF."))
+                button press=startHere buttonStyle="filled" testId="empty-action"
+                  text (key.saved ? "Add Something" : "Open Settings")
+            else
+              list id="library-list" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
+                if not key.saved
+                  section
+                    button press=openSettings testId="key-banner"
+                      text "Add your OpenAI key to make audio"
+                section
+                  for it in lib key=it.id
+                    link href=path("item", it.id) delete=remove(it.id) testId=`item-${it.id}`
+                      image (it.kind == "pdf" ? "symbol:document" : "symbol:link") aria-hidden=true
+                      column flex=1 min-width=0 gap=2
+                        text it.title line-clamp=2
+                        text (making == it.id ? `Making audio ${made(it) + 1} of ${it.parts.length}…` : summary(it))
+                          font="-exact-footnote" color="-exact-secondary-label" testId=`item-${it.id}-status`
+                      if playingId == it.id and not paused
+                        image "symbol:speaker" aria-label="Playing"
+                      image "symbol:forward-chevron"
+
+        if e.name == "item"
+          column navigationKey=`${e.id}` navigationScroll="item-detail" position="absolute" inset=0
+            display="flex" flex-direction="column"
+            header display="flex" align-items="center" padding="8px 16px"
+              text (found(lib, e.params.id) or pending(lib) ? titleOf(lib, e.params.id) : "Not Found") role="heading" aria-level=2 testId="detail-title"
+            if found(lib, e.params.id) or pending(lib)
+              list id="item-detail" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
+                for it in lib.filter(x => x.id == e.params.id) key=it.id
+                  section
+                    column gap=4 padding-top=8 padding-bottom=8
+                      text it.title font="-exact-title2" font-weight=600 testId="item-title"
+                      text it.source font="-exact-footnote" color="-exact-secondary-label" line-clamp=1
+                      text summary(it) font="-exact-footnote" color="-exact-secondary-label" testId="item-summary"
+                  if made(it) > 0
+                    section
+                      Player(item=it, current=(playingId == it.id), paused=paused, part=part,
+                        position=position, duration=duration, rate=rate,
+                        toggle=toggle(it.id), skip=skip, chooseRate=chooseRate)
+                  if not ready(it)
+                    section
+                      header
+                        text "Audio"
+                      if making == it.id
+                        row gap=12 align-items="center"
+                          progress value=made(it) max=it.parts.length aria-label="Making audio" flex=1 testId="make-progress"
+                          text `${made(it)} of ${it.parts.length}` font-variant-numeric="tabular-nums"
+                      else if key.saved
+                        button press=make(it.id) testId="make"
+                          text (made(it) > 0 ? "Make the Rest" : "Make Audio")
+                      else
+                        button press=openSettings testId="make-needs-key"
+                          text "Add your OpenAI key to make audio"
+                      footer
+                        text (makeError != "" and making == "" ? makeError : it.error)
+                          color="-exact-system-red" testId="make-error"
+                  section
+                    header
+                      text "Voice"
+                    row
+                      text "Voice"
+                      select value=voice change=chooseVoice aria-label="Voice" testId="voice"
+                        for v in ["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"] key=v
+                          option `${v.slice(0, 1).toUpperCase()}${v.slice(1)}` value=v
+                    footer
+                      text (it.voice != "" and it.voice != voice ? "Making audio again replaces it in the new voice." : "Voices are OpenAI’s.")
+                  section
+                    header
+                      text "Parts"
+                    for p in it.parts key=p.index
+                      button press=play(it.id, p.index) disabled=(p.path == "") testId=`part-${p.index}`
+                        row gap=8 align-items="center" flex=1
+                          text `Part ${p.index + 1}` flex=1
+                          if playingId == it.id and part == p.index
+                            image "symbol:speaker" aria-label="Now playing"
+                          else if p.path == ""
+                            text (making == it.id ? "Waiting" : "No audio") color="-exact-secondary-label"
+                  section
+                    button press=askRemove(it.id) destructive=true testId="delete"
+                      text "Delete"
+            else
+              EmptyState(symbol="symbol:alert", title="Not Found", message="It may have been deleted.")
+                button press=back buttonStyle="filled" testId="missing-back"
+                  text "Back to Library"
+
+        if e.name == "add"
+          column navigationKey=`${e.id}` navigationPresentation="modal" navigationScroll="add-form" position="absolute" inset=0
+            header display="flex" align-items="center" justify-content="space-between" padding="8px 16px"
+              button id="back" press=back aria-label="Cancel" testId="add-cancel"
+                image "symbol:close"
+              text "Add" role="heading"
+              button press=addLink buttonStyle="bordered-prominent" aria-label="Add Link" testId="add-save"
+                disabled=(draftUrl.trim() == "" or pending(added))
+                image "symbol:checkmark"
+            list id="add-form" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
+              section
+                header
+                  text "A link"
+                row
+                  input type="url" value=draftUrl input=editUrl submit=addLink autofocus=true
+                    placeholder="https://example.com/article" aria-label="Link" autocapitalize="none"
+                    testId="url" flex=1 min-width=0
+                footer
+                  text "The article on the page is read to you."
+              section
+                header
+                  text "A PDF"
+                button press=choosePdf disabled=(pending(added) or not key.saved) testId="choose-pdf"
+                  text "Choose a PDF…"
+                footer
+                  text (key.saved ? "OpenAI reads its text. Large documents take a minute." : "Reading a PDF needs your OpenAI key.")
+              if pending(added)
+                section
+                  row gap=12 align-items="center"
+                    progress aria-label="Adding"
+                    text "Reading…" testId="adding"
+              if addError != "" and not pending(added)
+                section
+                  text addError color="-exact-system-red" testId="add-error"
+            input type="file" accept="application/pdf" id="pdf-file" display="none" change=pdfPicked testId="pdf-file"
+
+        if e.name == "settings"
+          column navigationKey=`${e.id}` navigationPresentation="modal" navigationScroll="settings-form" position="absolute" inset=0
+            header display="flex" align-items="center" justify-content="space-between" padding="8px 16px"
+              button id="back" press=back aria-label="Done" testId="settings-done"
+                image "symbol:close"
+              text "Settings" role="heading"
+            list id="settings-form" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
+              section
+                header
+                  text "OpenAI key"
+                if key.saved
+                  row
+                    text "Saved key"
+                    text key.hint color="-exact-secondary-label" testId="key-hint"
+                  button press=forgetKey destructive=true testId="forget-key"
+                    text "Remove Key"
+                else
+                  row gap=8 align-items="center"
+                    input type="password" value=draftKey input=editKey submit=saveKey placeholder="sk-…"
+                      aria-label="OpenAI key" autocapitalize="none" autocomplete="off" testId="key"
+                      flex=1 min-width=0
+                    button press=saveKey disabled=(draftKey.trim() == "" or pending(keySaved)) testId="save-key"
+                      text "Save"
+                footer
+                  text (keyError != "" ? keyError : "Your key stays on this device, in its Keychain. It’s sent only to OpenAI, to read PDFs and make audio.")
+                    testId="key-footer"
+
+      // The one player, outside the routes: it keeps playing while you browse.
+      if nowPath != ""
+        audio nowPath id="player" paused=paused currentTime=seekTo playbackRate=rate preload="auto"
+          play=playing pause=stopped timeupdate=timed durationchange=measured ended=ended
+          metadata=MediaMetadata(title=nowTitle, artist="Read To Me", album=`Part ${part + 1}`, artwork="")
+          seekbackward=skip(-15) seekforward=skip(15) seekbackwardOffset=15 seekforwardOffset=15
+          testId="audio"
+
+      dialog id="remove" role="alertdialog" aria-label="Delete This Item?"
+        text "Its audio is deleted too."
+        button press=remove(aimed) destructive=true commandfor="remove" command="close" testId="remove-confirm"
+          text "Delete"
+        button commandfor="remove" command="close" testId="remove-cancel"
+          text "Cancel"
+
+// The controls for one item: where it is, play and pause, 15 seconds back and on, and speed.
+component Player
+  props
+    item: Item
+    current: bool
+    paused: bool
+    part: number
+    position: number
+    duration: number
+    rate: number
+    toggle: action
+    skip: action
+    chooseRate: action
+  view
+    column gap=12 padding-top=12 padding-bottom=12 align-items="stretch" flex=1
+      text (current ? `Part ${part + 1} of ${item.parts.length}` : `${item.parts.length} ${item.parts.length == 1 ? "part" : "parts"}`)
+        font="-exact-footnote" color="-exact-secondary-label" text-align="center" testId="now-part"
+      progress value=(current and duration > 0 ? position : 0) max=(current and duration > 0 ? duration : 1) aria-label="Position"
+      row justify-content="space-between"
+        text (current ? clockText(position) : "0:00") font="-exact-caption1" font-variant-numeric="tabular-nums" testId="elapsed"
+        text (current ? clockText(duration) : "") font="-exact-caption1" font-variant-numeric="tabular-nums"
+      row justify-content="center" align-items="center" gap=32
+        button press=skip(-15) disabled=(not current) aria-label="Back 15 seconds" testId="back-15"
+          image "symbol:skip-back-15" font="-exact-title1"
+        button press=toggle aria-label=(current and not paused ? "Pause" : "Play") testId="play"
+          image (current and not paused ? "symbol:pause-fill" : "symbol:play-fill") font="-exact-large-title"
+        button press=skip(15) disabled=(not current) aria-label="Forward 15 seconds" testId="forward-15"
+          image "symbol:skip-forward-15" font="-exact-title1"
+      row justify-content="center" align-items="center" gap=8
+        text "Speed" color="-exact-secondary-label"
+        select value=(rate == 1 ? "1" : `${rate}`) change=chooseRate aria-label="Speed" testId="speed"
+          for r in ["0.75", "1", "1.25", "1.5", "2"] key=r
+            option `${r}×` value=r
